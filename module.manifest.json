@@ -1,0 +1,11 @@
+{
+  "key": "demo-widget",
+  "name": "Demo Widget",
+  "permissionPrefix": "demo-widget",
+  "uiPackageName": "@prowerbdigital/module-demo-widget-ui",
+  "kongRoute": "/demo-widget/api",
+  "deliveryTarget": "non_production",
+  "topology": "standalone_service",
+  "consumesEntities": [],
+  "repoUrl": ""
+}

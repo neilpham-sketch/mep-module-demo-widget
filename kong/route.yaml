@@ -1,0 +1,49 @@
+# Kong route reservation for Demo Widget, created at generation time (docs/ADR-0001,
+# ADR-0004) — delivery only ever activates this pre-existing slot, never creates a route.
+services:
+  - name: module-demo-widget
+    # $VAR placeholder for the full upstream URL, substituted at container start —
+    # matches the existing convention every other service's Kong config already uses
+    # (e.g. $CORE_URL), not a literal host:port.
+    url: ${MODULE_DEMO_WIDGET_URL}
+    routes:
+      - name: module-demo-widget-public
+        paths:
+          - /demo-widget/api/v1/health
+          - /demo-widget/api/docs
+        strip_path: false
+      - name: module-demo-widget-api
+        paths:
+          - /demo-widget/api
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              header_names: [authorization]
+              claims_to_verify: [exp]
+          - name: jwt-claims-forwarder
+            enabled: true
+  - name: module-demo-widget-ext
+    # Separate upstream from apps/internal above — apps/external deploys and scales
+    # independently (docs/ADR-0001), so it gets its own Kong service/URL, not just an
+    # extra route on the same upstream.
+    url: ${MODULE_DEMO_WIDGET_EXT_URL}
+    routes:
+      - name: module-demo-widget-ext-public
+        paths:
+          - /demo-widget/ext/api/v1/health
+          - /demo-widget/ext/api/docs
+        strip_path: false
+      - name: module-demo-widget-ext-api
+        paths:
+          - /demo-widget/ext/api
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              header_names: [authorization]
+              claims_to_verify: [exp]
+          - name: jwt-claims-forwarder
+            enabled: true

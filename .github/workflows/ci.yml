@@ -1,0 +1,101 @@
+name: CI (module-demo-widget)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nestjs_mep
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Enable pnpm via corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint:check
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Verify manifest consistency (ADR-0010)
+        run: pnpm verify:manifest
+
+      - name: Configure environment (matches the postgres service's credentials above)
+        run: |
+          cp apps/internal/.env.example apps/internal/.env
+          cp apps/internal/venv/.env.example apps/internal/venv/.env.dev
+          cp apps/external/.env.example apps/external/.env
+          cp apps/external/venv/.env.example apps/external/venv/.env.dev
+
+      - name: Run database migrations
+        run: pnpm db:generate && pnpm db:migrate
+
+      - name: Boot the internal backend
+        run: pnpm start:dev > /tmp/internal.log 2>&1 &
+
+      - name: Boot the external backend
+        run: pnpm dev:external > /tmp/external.log 2>&1 &
+
+      - name: Wait for the backend to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/demo-widget/api/v1/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "internal backend never became healthy" >&2
+          exit 1
+
+      - name: Wait for the external backend to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8081/demo-widget/ext/api/v1/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "external backend never became healthy" >&2
+          exit 1
+
+      - name: Show backend logs on failure
+        if: failure()
+        run: |
+          cat /tmp/internal.log || true
+          cat /tmp/external.log || true
+
+      # No browser install step here: api.spec.ts uses Playwright's `request` fixture only
+      # (raw HTTP, no browser binary needed). Add `npx playwright install --with-deps` here
+      # once ui.spec.ts (currently test.fixme()'d) becomes a real, browser-driven test.
+      - name: Run end-to-end tests
+        run: pnpm e2e

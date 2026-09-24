@@ -1,0 +1,49 @@
+services:
+  module-demo-widget-internal:
+    image: ${DOCKER_REGISTRY_URL}/module-demo-widget-internal:${TAG_INTERNAL}
+    container_name: module-demo-widget-internal
+    build:
+      context: ..
+      dockerfile: apps/internal/Dockerfile
+    environment:
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID}
+      INFISICAL_TOKEN: ${INFISICAL_TOKEN}
+      INFISICAL_ENV: ${INFISICAL_ENV}
+      INFISICAL_DOMAIN: ${INFISICAL_DOMAIN}
+    networks:
+      - mep
+    restart: on-failure
+
+  module-demo-widget-external:
+    image: ${DOCKER_REGISTRY_URL}/module-demo-widget-external:${TAG_EXTERNAL}
+    container_name: module-demo-widget-external
+    build:
+      context: ..
+      dockerfile: apps/external/Dockerfile
+    environment:
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID}
+      INFISICAL_TOKEN: ${INFISICAL_TOKEN}
+      INFISICAL_ENV: ${INFISICAL_ENV}
+      INFISICAL_DOMAIN: ${INFISICAL_DOMAIN}
+    networks:
+      - mep
+    restart: on-failure
+
+  module-demo-widget-worker:
+    image: ${DOCKER_REGISTRY_URL}/module-demo-widget-worker:${TAG_WORKER}
+    container_name: module-demo-widget-worker
+    build:
+      context: ..
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID}
+      INFISICAL_TOKEN: ${INFISICAL_TOKEN}
+      INFISICAL_ENV: ${INFISICAL_ENV}
+      INFISICAL_DOMAIN: ${INFISICAL_DOMAIN}
+    networks:
+      - mep
+    restart: on-failure
+
+networks:
+  mep:
+    external: true

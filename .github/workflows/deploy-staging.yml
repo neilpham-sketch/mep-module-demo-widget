@@ -1,0 +1,483 @@
+name: Demo Widget — Build and Deploy Staging
+
+# Mirrors mep-etr's proven deploy-staging.yml 1:1 (docs/ADR-0004 — copy the pipeline that
+# already works on the real platform, don't invent a new one): same detect-changes /
+# prepare-metadata / build-push / deploy / notify-result job shape, same long-lived AWS
+# keys (not OIDC — that's what's actually wired up on the shared runners today), same
+# git-clone-on-host deploy script, same Infisical-backed runtime config, same real MS
+# Teams notification.
+#
+# Secrets/vars below are read from the GitHub Environment named "staging" (job-level
+# `environment: staging`), except GH_TOKEN, which is a plain repo secret shared across
+# every environment. scripts/setup-github-repo.sh sets all of these up.
+
+on:
+  push:
+    branches: ['staging']
+    paths:
+      - 'apps/**'
+      - 'libs/**'
+      - '**/Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/deploy-staging.yml'
+
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated: external,internal,worker or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - external
+          - internal
+          - worker
+      image_tag_external:
+        description: 'Image tag for module-demo-widget-external (leave empty = build new from source)'
+        required: false
+        default: ''
+        type: string
+      image_tag_internal:
+        description: 'Image tag for module-demo-widget-internal (leave empty = build new from source)'
+        required: false
+        default: ''
+        type: string
+      image_tag_worker:
+        description: 'Image tag for module-demo-widget-worker (leave empty = build new from source)'
+        required: false
+        default: ''
+        type: string
+      skip_build:
+        description: 'Skip build and only redeploy existing image tags above'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ============================================================================
+  # Detect which services changed
+  # ============================================================================
+  detect-changes:
+    name: Detect Service Changes
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.check-src.outputs.has_changes }}
+      services: ${{ steps.set-services.outputs.services }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed services
+        id: changes
+        run: |
+          # Manual dispatch: use input, skip git diff
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT="${{ github.event.inputs.services }}"
+            if [ "$INPUT" = "all" ]; then
+              echo "external=true" >> $GITHUB_OUTPUT
+              echo "internal=true"   >> $GITHUB_OUTPUT
+              echo "worker=true"   >> $GITHUB_OUTPUT
+            else
+              echo "external=$(echo "$INPUT" | grep -q 'external' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+              echo "internal=$(echo "$INPUT" | grep -q 'internal' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+              echo "worker=$(echo "$INPUT"   | grep -q 'worker'   && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+            fi
+            echo "libs=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo "---"
+
+          echo "external=$(echo "$CHANGED_FILES" | grep -qE '^apps/external/|^libs/' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "internal=$(echo "$CHANGED_FILES" | grep -qE '^apps/internal/|^libs/' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "worker=$(echo "$CHANGED_FILES" | grep -qE '^apps/worker/|^libs/' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "libs=$(echo "$CHANGED_FILES" | grep -q '^libs/' && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+      - name: Set services to build
+        id: set-services
+        run: |
+          CHANGED_SERVICES=()
+
+          if [ "${{ steps.changes.outputs.external }}" == "true" ]; then
+            CHANGED_SERVICES+=("external")
+          fi
+          if [ "${{ steps.changes.outputs.internal }}" == "true" ]; then
+            CHANGED_SERVICES+=("internal")
+          fi
+          if [ "${{ steps.changes.outputs.worker }}" == "true" ]; then
+            CHANGED_SERVICES+=("worker")
+          fi
+
+          # If libs changed, rebuild all services
+          if [ "${{ steps.changes.outputs.libs }}" == "true" ]; then
+            CHANGED_SERVICES=("external" "internal" "worker")
+          fi
+
+          if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
+            SERVICES='[]'
+          else
+            SERVICES=$(printf '%s\n' "${CHANGED_SERVICES[@]}" | jq -R . | jq -sc .)
+          fi
+
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "Services to build: $SERVICES"
+
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          SERVICES='${{ steps.set-services.outputs.services }}'
+          echo "matrix={\"service\":$SERVICES}" >> $GITHUB_OUTPUT
+
+      - name: Check if source changed
+        id: check-src
+        run: |
+          SERVICES='${{ steps.set-services.outputs.services }}'
+          if [ "$SERVICES" != "[]" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # Prepare build metadata
+  # ============================================================================
+  prepare-metadata:
+    name: Prepare Build Metadata
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.src == 'true'
+    outputs:
+      build-date: ${{ steps.metadata.outputs.build-date }}
+      short-sha: ${{ steps.metadata.outputs.short-sha }}
+      env-name: ${{ steps.metadata.outputs.env-name }}
+      versions: ${{ steps.metadata.outputs.versions }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate metadata
+        id: metadata
+        run: |
+          BUILD_DATE=$(date +'%Y%m%d')
+          echo "build-date=$BUILD_DATE" >> $GITHUB_OUTPUT
+
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "short-sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+          ENV_NAME="staging"
+          echo "env-name=$ENV_NAME" >> $GITHUB_OUTPUT
+
+          SERVICES='${{ needs.detect-changes.outputs.services }}'
+          readarray -t SERVICE_ARRAY < <(echo "$SERVICES" | jq -r '.[]')
+
+          VERSIONS="{"
+          for service in "${SERVICE_ARRAY[@]}"; do
+            VERSION=$(cat apps/$service/VERSION | tr -d '[:space:]')
+            VERSIONS="${VERSIONS}\"${service}\":\"${VERSION}\","
+          done
+          VERSIONS="${VERSIONS%,}}"
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Build and push Docker images to ECR
+  # ============================================================================
+  build-push:
+    name: Build and Push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, prepare-metadata]
+    if: needs.detect-changes.outputs.src == 'true' && github.event.inputs.skip_build != 'true'
+    environment: staging
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve @prowerbdigital package versions
+        id: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          COMMON_VERSION=$(npm view @prowerbdigital/common version)
+          CONTRACT_VERSION=$(npm view @prowerbdigital/contract version)
+          [ -n "$COMMON_VERSION" ] && [ -n "$CONTRACT_VERSION" ]
+          echo "common-version=$COMMON_VERSION"     >> $GITHUB_OUTPUT
+          echo "contract-version=$CONTRACT_VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved @prowerbdigital/common@$COMMON_VERSION | @prowerbdigital/contract@$CONTRACT_VERSION"
+
+      - name: Build tag from metadata
+        id: tag
+        run: |
+          VERSION=$(cat apps/${{ matrix.service }}/VERSION | tr -d '[:space:]')
+          TAG="${{ needs.prepare-metadata.outputs.env-name }}-v${VERSION}-${{ needs.prepare-metadata.outputs.build-date }}-${{ needs.prepare-metadata.outputs.short-sha }}"
+          echo "value=$TAG" >> $GITHUB_OUTPUT
+          # Map service name to ECR repo name
+          case "${{ matrix.service }}" in
+            external) echo "ecr-repo=module-demo-widget-external" >> $GITHUB_OUTPUT ;;
+            internal) echo "ecr-repo=module-demo-widget-internal" >> $GITHUB_OUTPUT ;;
+            worker)   echo "ecr-repo=module-demo-widget-worker"   >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.service }}/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            COMMON_VERSION=${{ steps.pkg.outputs.common-version }}
+            CONTRACT_VERSION=${{ steps.pkg.outputs.contract-version }}
+          tags: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/mepsaas/${{ steps.tag.outputs.ecr-repo }}:${{ steps.tag.outputs.value }}
+          cache-from: type=registry,ref=${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/mepsaas/${{ steps.tag.outputs.ecr-repo }}:cache-${{ needs.prepare-metadata.outputs.env-name }}
+          cache-to: type=registry,ref=${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/mepsaas/${{ steps.tag.outputs.ecr-repo }}:cache-${{ needs.prepare-metadata.outputs.env-name }},mode=max,image-manifest=true,oci-mediatypes=true
+          provenance: false
+          secrets: |
+            npm_token=${{ secrets.GH_TOKEN }}
+
+  # ============================================================================
+  # Deploy to server via SSH
+  # ============================================================================
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-push, prepare-metadata]
+    if: needs.detect-changes.outputs.src == 'true'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build deployment tags
+        id: tags
+        run: |
+          SERVICES='${{ needs.detect-changes.outputs.services }}'
+          TAGS=""
+          SERVICE_LIST=""
+          for service in $(echo $SERVICES | jq -r '.[]'); do
+            # Manual dispatch with skip_build: use provided image tags
+            if [ "${{ github.event.inputs.skip_build }}" = "true" ]; then
+              case "$service" in
+                external)
+                  TAG="${{ github.event.inputs.image_tag_external }}"
+                  [ -z "$TAG" ] && echo "ERROR: image_tag_external is required when skip_build=true" && exit 1
+                  ;;
+                internal)
+                  TAG="${{ github.event.inputs.image_tag_internal }}"
+                  [ -z "$TAG" ] && echo "ERROR: image_tag_internal is required when skip_build=true" && exit 1
+                  ;;
+                worker)
+                  TAG="${{ github.event.inputs.image_tag_worker }}"
+                  [ -z "$TAG" ] && echo "ERROR: image_tag_worker is required when skip_build=true" && exit 1
+                  ;;
+              esac
+            else
+              VERSION=$(cat apps/$service/VERSION | tr -d '[:space:]')
+              TAG="${{ needs.prepare-metadata.outputs.env-name }}-v${VERSION}-${{ needs.prepare-metadata.outputs.build-date }}-${{ needs.prepare-metadata.outputs.short-sha }}"
+            fi
+            TAGS="${TAGS}${service}=${TAG},"
+            SERVICE_LIST="${SERVICE_LIST}${service} "
+          done
+          echo "service-tags=${TAGS%,}" >> $GITHUB_OUTPUT
+          echo "service-list=${SERVICE_LIST% }" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH key
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          KEY_INPUT='${{ secrets.SSH_PRIVATE_KEY_B64 }}'
+
+          if printf '%s' "$KEY_INPUT" | grep -qE 'BEGIN (RSA|EC|OPENSSH|DSA|ED25519) PRIVATE KEY'; then
+            printf '%s\n' "$KEY_INPUT" > ~/.ssh/deploy_key
+          else
+            if ! printf '%s' "$KEY_INPUT" | tr -d '\r\n ' | base64 -d > ~/.ssh/deploy_key 2>/dev/null; then
+              printf '%s\n' "$KEY_INPUT" > ~/.ssh/deploy_key
+            fi
+          fi
+
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -l -f ~/.ssh/deploy_key
+          ssh-keyscan -p 22 ${{ vars.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Write deploy script
+        env:
+          CHANGED_SERVICES: ${{ steps.tags.outputs.service-list }}
+          SERVICE_TAGS: ${{ steps.tags.outputs.service-tags }}
+        run: |
+          cat > /tmp/deploy.sh << DEPLOY_EOF
+          #!/bin/bash
+          set -e
+          CHANGED_SERVICES="${CHANGED_SERVICES}"
+          SERVICE_TAGS="${SERVICE_TAGS}"
+          ECR_REGISTRY="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com"
+
+          # Install AWS CLI v2 if not present
+          if ! command -v aws &>/dev/null; then
+            echo "Installing AWS CLI..."
+            if ! command -v unzip &>/dev/null; then
+              apt-get update -qq && apt-get install -y -qq unzip
+            fi
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp/awscliv2-install
+            /tmp/awscliv2-install/aws/install --update
+            rm -rf /tmp/awscliv2.zip /tmp/awscliv2-install
+          fi
+
+          # Clone or pull the repo
+          if [ ! -d /home/github/mep-module-demo-widget/.git ]; then
+            rm -rf /home/github/mep-module-demo-widget
+            git clone https://${{ secrets.GH_TOKEN }}@github.com/ProwerbDigital/mep-module-demo-widget.git /home/github/mep-module-demo-widget
+          fi
+          cd /home/github/mep-module-demo-widget
+          git fetch origin
+          git checkout ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+
+          # Authenticate with ECR
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          export AWS_DEFAULT_REGION="${{ vars.AWS_REGION }}"
+          aws ecr get-login-password --region ${{ vars.AWS_REGION }} \
+            | docker login --username AWS --password-stdin "\${ECR_REGISTRY}"
+
+          # Write .env file
+          {
+            echo "DOCKER_REGISTRY_URL=\${ECR_REGISTRY}/mepsaas"
+            echo "HOST=${{ vars.HOST }}"
+            echo "INFISICAL_PROJECT_ID=${{ vars.INFISICAL_PROJECT_ID }}"
+            echo "INFISICAL_TOKEN=${{ secrets.INFISICAL_TOKEN }}"
+            echo "INFISICAL_ENV=${{ vars.INFISICAL_ENV }}"
+            echo "INFISICAL_DOMAIN=${{ secrets.INFISICAL_DOMAIN }}"
+          } > docker/.env
+
+          # Append image tags for changed services
+          IFS=',' read -ra TAGS <<< "\${SERVICE_TAGS}"
+          for tag_pair in "\${TAGS[@]}"; do
+            service="\${tag_pair%%=*}"
+            tag="\${tag_pair#*=}"
+            case "\${service}" in
+              external) echo "TAG_EXTERNAL=\${tag}" >> docker/.env ;;
+              internal) echo "TAG_INTERNAL=\${tag}" >> docker/.env ;;
+              worker)   echo "TAG_WORKER=\${tag}"   >> docker/.env ;;
+            esac
+          done
+
+          # Pull and restart only changed services
+          echo "=== Deploying: \${CHANGED_SERVICES} ==="
+          for service in \${CHANGED_SERVICES}; do
+            compose_svc="module-demo-widget-\${service}"
+            echo "-> Pulling and restarting: \${compose_svc}"
+            docker compose -f docker/docker-compose.yml pull "\${compose_svc}"
+            docker compose -f docker/docker-compose.yml up -d --no-deps "\${compose_svc}"
+          done
+          echo "=== Deployment completed ==="
+
+          docker container prune -f
+          docker image prune -f
+          docker builder prune -f
+          DEPLOY_EOF
+
+      - name: Deploy via SSH
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o BatchMode=yes \
+            ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }} \
+            'bash -s' < /tmp/deploy.sh
+
+  # ============================================================================
+  # Notify Teams on result
+  # ============================================================================
+  notify-result:
+    name: Notify Deployment Result
+    runs-on: ubuntu-latest
+    needs: [detect-changes, prepare-metadata, deploy]
+    if: always() && (needs.detect-changes.outputs.src == 'true' || github.event_name == 'workflow_dispatch')
+    environment: staging
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "status=Success" >> $GITHUB_OUTPUT
+            echo "color=28a745" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy.result }}" == "failure" ]; then
+            echo "status=Failed" >> $GITHUB_OUTPUT
+            echo "color=d73a4a" >> $GITHUB_OUTPUT
+          else
+            echo "status=${{ needs.deploy.result }}" >> $GITHUB_OUTPUT
+            echo "color=ffa500" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Teams Notification
+        if: always()
+        run: |
+          if [ -z "${{ secrets.MSTEAMS_WEBHOOK_URL }}" ]; then
+            echo "MSTEAMS_WEBHOOK_URL secret is empty or not set, skipping."
+            exit 0
+          fi
+          echo "Webhook URL is set, sending notification..."
+          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | head -n 1 | jq -Rs . | sed 's/^"//;s/"$//')
+          SERVICES='${{ needs.detect-changes.outputs.services }}'
+          VERSIONS='${{ needs.prepare-metadata.outputs.versions }}'
+          VERSIONS_TABLE=""
+          readarray -t SERVICE_ARRAY < <(echo "$SERVICES" | jq -r '.[]')
+          for service in "${SERVICE_ARRAY[@]}"; do
+            version=$(echo $VERSIONS | jq -r ".\"$service\"")
+            VERSIONS_TABLE="${VERSIONS_TABLE}- **module-demo-widget-${service}**: v${version}\n"
+          done
+
+          cat > payload.json <<EOF
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": "Demo Widget Deployment ${{ needs.deploy.result }}",
+            "themeColor": "${{ steps.status.outputs.color }}",
+            "title": "${{ steps.status.outputs.status }} Demo Widget Staging Deployment",
+            "sections": [{
+              "activityTitle": "Demo Widget Deployment",
+              "activitySubtitle": "Branch: **${{ github.ref_name }}**",
+              "facts": [
+                {"name": "Status:", "value": "${{ steps.status.outputs.status }}"},
+                {"name": "Triggered by:", "value": "${{ github.actor }}"},
+                {"name": "Commit:", "value": "${COMMIT_MSG}"},
+                {"name": "Short SHA:", "value": "${{ needs.prepare-metadata.outputs.short-sha }}"},
+                {"name": "Build Date:", "value": "${{ needs.prepare-metadata.outputs.build-date }}"}
+              ],
+              "text": "**Deployed Versions:**\n\n${VERSIONS_TABLE}"
+            }],
+            "potentialAction": [{
+              "@type": "OpenUri",
+              "name": "View Workflow",
+              "targets": [{"os": "default", "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}]
+            }]
+          }
+          EOF
+
+          curl -H "Content-Type: application/json" -d @payload.json "${{ secrets.MSTEAMS_WEBHOOK_URL }}"
